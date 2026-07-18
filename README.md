@@ -2,6 +2,10 @@
 
 Liquify Lab is an iPad prototype that records liquify gestures and plays them back over time. It explores the engineering behind a responsive creative tool: Apple Pencil input, custom UIKit controls, timeline playback, and a real time Metal displacement pipeline.
 
+## Demo
+
+![Liquify Lab animated demo](project-demo.gif)
+
 ## Highlights
 
 - UIKit editor with a custom, directly scrubbable timeline
