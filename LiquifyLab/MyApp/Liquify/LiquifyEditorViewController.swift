@@ -2,7 +2,22 @@ import MetalKit
 import PhotosUI
 import UIKit
 
-final class LiquifyEditorViewController: UIViewController, PHPickerViewControllerDelegate {
+/// A gesture recognizer that observes touch down without cancelling the underlying interaction
+private final class TouchDownGestureRecognizer: UIGestureRecognizer {
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        state = .recognized
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+}
+
+final class LiquifyEditorViewController: UIViewController, PHPickerViewControllerDelegate, UIGestureRecognizerDelegate {
     private enum ButtonMaterialStyle {
         case glass
         case clearGlass
@@ -10,6 +25,7 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
 
     private let canvas = LiquifyCanvasView(frame: .zero, device: MTLCreateSystemDefaultDevice())
     private let timeline = TimelineControl()
+    private let inputMetricsView = InputMetricsView()
     private let performanceLabel = UILabel()
     private let undoButton = UIButton(type: .system)
     private let redoButton = UIButton(type: .system)
@@ -18,9 +34,19 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
     private let originalButton = UIButton(type: .system)
     private let inspectorButton = UIButton(type: .system)
     private let inspector = UIVisualEffectView()
+    private lazy var inspectorDismissRecognizer: UIGestureRecognizer = {
+        let recognizer = TouchDownGestureRecognizer(
+            target: self,
+            action: #selector(dismissInspectorIfNeeded)
+        )
+        recognizer.cancelsTouchesInView = false
+        recognizer.delegate = self
+        return recognizer
+    }()
 
     private var displayLink: CADisplayLink?
     private var playbackStart: CFTimeInterval?
+    private var playbackOriginProgress: Float = 0
     private var isPlaying = false
     private var isInspectorVisible = false
     private var lastFrameTimestamp: CFTimeInterval = 0
@@ -33,6 +59,12 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         configureInterface()
         configureActions()
 
+        canvas.onInputMetricsChanged = { [weak self] metrics in
+            self?.inputMetricsView.update(with: metrics)
+        }
+        canvas.onInputMetricsEnded = { [weak self] in
+            self?.inputMetricsView.reset()
+        }
         canvas.setSourceImage(DemoImageFactory.makeImage())
         canvas.liquifyRenderer?.onHistoryChanged = { [weak self] in
             self?.updateHistoryButtons()
@@ -72,21 +104,37 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         configureInspector()
 
         view.addSubview(canvas)
+        view.addSubview(inputMetricsView)
         view.addSubview(controlsDeck)
         controlsDeck.addSubview(topBar)
         controlsDeck.addSubview(timelinePanel)
         controlsDeck.addSubview(inspector)
         canvas.translatesAutoresizingMaskIntoConstraints = false
+        inputMetricsView.translatesAutoresizingMaskIntoConstraints = false
         controlsDeck.translatesAutoresizingMaskIntoConstraints = false
         timelinePanel.translatesAutoresizingMaskIntoConstraints = false
         topBar.translatesAutoresizingMaskIntoConstraints = false
         inspector.translatesAutoresizingMaskIntoConstraints = false
+
+        let inputMetricsWidth = inputMetricsView.widthAnchor.constraint(
+            equalTo: canvas.widthAnchor,
+            constant: -24
+        )
+        inputMetricsWidth.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
             canvas.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
             canvas.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 8),
             canvas.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
             canvas.bottomAnchor.constraint(equalTo: controlsDeck.topAnchor, constant: -6),
+
+            inputMetricsView.topAnchor.constraint(equalTo: canvas.topAnchor, constant: 12),
+            inputMetricsView.centerXAnchor.constraint(equalTo: canvas.centerXAnchor),
+            inputMetricsView.leadingAnchor.constraint(greaterThanOrEqualTo: canvas.leadingAnchor, constant: 12),
+            inputMetricsView.trailingAnchor.constraint(lessThanOrEqualTo: canvas.trailingAnchor, constant: -12),
+            inputMetricsView.widthAnchor.constraint(lessThanOrEqualToConstant: 720),
+            inputMetricsWidth,
+            inputMetricsView.heightAnchor.constraint(equalToConstant: 82),
 
             controlsDeck.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 8),
             controlsDeck.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
@@ -182,11 +230,6 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         panel.layer.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
         panel.clipsToBounds = true
 
-        let modeLabel = UILabel()
-        modeLabel.text = "●  PUSH DEFORMATION"
-        modeLabel.font = .systemFont(ofSize: 10, weight: .bold)
-        modeLabel.textColor = EditorPalette.accent
-
         var playConfiguration = UIButton.Configuration.plain()
         playConfiguration.image = UIImage(systemName: "play.fill")
         playConfiguration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
@@ -219,14 +262,10 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         rightControls.spacing = 10
 
         let header = UIView()
-        header.addSubview(modeLabel)
         header.addSubview(playButton)
         header.addSubview(rightControls)
-        [modeLabel, playButton, rightControls].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        [playButton, rightControls].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
         NSLayoutConstraint.activate([
-            modeLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            modeLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            modeLabel.trailingAnchor.constraint(lessThanOrEqualTo: playButton.leadingAnchor, constant: -14),
             playButton.centerXAnchor.constraint(equalTo: header.centerXAnchor),
             playButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             playButton.widthAnchor.constraint(equalToConstant: 48),
@@ -322,9 +361,17 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
     // MARK: - Actions
 
     private func configureActions() {
+        view.addGestureRecognizer(inspectorDismissRecognizer)
+
         inspectorButton.addAction(UIAction { [weak self] _ in self?.toggleInspector() }, for: .touchUpInside)
-        undoButton.addAction(UIAction { [weak self] _ in self?.canvas.undo() }, for: .touchUpInside)
-        redoButton.addAction(UIAction { [weak self] _ in self?.canvas.redo() }, for: .touchUpInside)
+        undoButton.addAction(UIAction { [weak self] _ in
+            self?.stopPlayback(resetToEnd: false)
+            self?.canvas.undo()
+        }, for: .touchUpInside)
+        redoButton.addAction(UIAction { [weak self] _ in
+            self?.stopPlayback(resetToEnd: false)
+            self?.canvas.redo()
+        }, for: .touchUpInside)
         resetButton.addAction(UIAction { [weak self] _ in
             self?.stopPlayback(resetToEnd: true)
             self?.canvas.reset()
@@ -379,12 +426,29 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
     // MARK: - Editor state and playback
 
     private func toggleInspector() {
-        isInspectorVisible.toggle()
-        inspector.isUserInteractionEnabled = isInspectorVisible
-        inspectorButton.isSelected = isInspectorVisible
-        inspectorButton.accessibilityLabel = isInspectorVisible ? "Hide Push settings" : "Show Push settings"
-        inspectorButton.configuration?.baseForegroundColor = isInspectorVisible ? EditorPalette.accent : UIColor.white.withAlphaComponent(0.72)
-        if isInspectorVisible {
+        setInspectorVisible(!isInspectorVisible)
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard gestureRecognizer === inspectorDismissRecognizer, isInspectorVisible else { return false }
+        let location = touch.location(in: view)
+        let inspectorFrame = inspector.convert(inspector.bounds, to: view)
+        let buttonFrame = inspectorButton.convert(inspectorButton.bounds, to: view)
+        return !inspectorFrame.contains(location) && !buttonFrame.contains(location)
+    }
+
+    @objc private func dismissInspectorIfNeeded() {
+        setInspectorVisible(false)
+    }
+
+    private func setInspectorVisible(_ visible: Bool) {
+        guard visible != isInspectorVisible else { return }
+        isInspectorVisible = visible
+        inspector.isUserInteractionEnabled = visible
+        inspectorButton.isSelected = visible
+        inspectorButton.accessibilityLabel = visible ? "Hide Push settings" : "Show Push settings"
+        inspectorButton.configuration?.baseForegroundColor = visible ? EditorPalette.accent : UIColor.white.withAlphaComponent(0.72)
+        if visible {
             inspector.transform = CGAffineTransform(scaleX: 0.92, y: 0.92).translatedBy(x: 0, y: -8)
         }
         UIView.animate(
@@ -394,15 +458,17 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
             initialSpringVelocity: 0.4,
             options: [.beginFromCurrentState, .allowUserInteraction]
         ) {
-            self.inspector.alpha = self.isInspectorVisible ? 1 : 0
-            self.inspector.transform = self.isInspectorVisible ? .identity : CGAffineTransform(scaleX: 0.92, y: 0.92).translatedBy(x: 0, y: -8)
+            self.inspector.alpha = visible ? 1 : 0
+            self.inspector.transform = visible
+                ? .identity
+                : CGAffineTransform(scaleX: 0.92, y: 0.92).translatedBy(x: 0, y: -8)
         }
     }
 
     private func updateHistoryButtons() {
         undoButton.isEnabled = canvas.canUndo
         redoButton.isEnabled = canvas.canRedo
-        resetButton.isEnabled = canvas.canUndo
+        resetButton.isEnabled = canvas.hasEdits
     }
 
     private func updateTimelineMetadata() {
@@ -424,9 +490,11 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         if isPlaying {
             stopPlayback(resetToEnd: false)
         } else {
+            let startProgress: Float = timeline.progress >= 1 ? 0 : timeline.progress
             isPlaying = true
-            timeline.progress = 0
-            canvas.setPlaybackProgress(0)
+            playbackOriginProgress = startProgress
+            timeline.progress = startProgress
+            canvas.setPlaybackProgress(startProgress)
             playbackStart = nil
             playButton.configuration?.image = UIImage(systemName: "pause.fill")
             playButton.accessibilityLabel = "Pause deformation"
@@ -455,7 +523,8 @@ final class LiquifyEditorViewController: UIViewController, PHPickerViewControlle
         if isPlaying {
             if playbackStart == nil { playbackStart = link.timestamp }
             let elapsed = link.timestamp - (playbackStart ?? link.timestamp)
-            let progress = Float(elapsed) / max(LiquifyConfiguration.Timeline.minimumDuration, canvas.timelineDuration)
+            let progress = playbackOriginProgress +
+                Float(elapsed) / max(LiquifyConfiguration.Timeline.minimumDuration, canvas.timelineDuration)
             if progress >= 1 {
                 timeline.progress = 1
                 canvas.setPlaybackProgress(1)

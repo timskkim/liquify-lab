@@ -1,6 +1,6 @@
 import UIKit
 
-/// Produces demo artwork so the interaction is useful immediately after launch.
+/// Produces demo artwork so the interaction is useful immediately after launch
 enum DemoImageFactory {
     static func makeImage() -> UIImage {
         let size = CGSize(width: 1600, height: 1100)

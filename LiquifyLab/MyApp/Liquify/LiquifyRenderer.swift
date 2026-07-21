@@ -4,7 +4,7 @@ import UIKit
 /// A single, pressure adjusted displacement sample in normalized image space.
 ///
 /// Keep this memory layout synchronized with `BrushStamp` in
-/// `LiquifyShaders.metal`; instances are copied directly into an `MTLBuffer`.
+/// `LiquifyShaders.metal`; instances are copied directly into an `MTLBuffer`
 struct LiquifyBrushStamp {
     var location: SIMD2<Float>
     var delta: SIMD2<Float>
@@ -14,7 +14,7 @@ struct LiquifyBrushStamp {
 }
 
 /// Chooses the smallest read/write representation supported by the active GPU.
-/// Tier 2 packs XY into one half-float texture; tier 1 uses two baseline R32 textures.
+/// Tier 2 packs XY into one half-float texture; tier 1 uses two baseline R32 textures
 private enum DisplacementStorage {
     case tier1(x: MTLTexture, y: MTLTexture)
     case tier2(MTLTexture)
@@ -38,7 +38,39 @@ private enum DisplacementStorage {
     }
 }
 
+/// Retains only the most recent states so snapshot based undo cant grow unbounded
+private struct HistoryStack<State> {
+    private let capacity: Int
+    private var states: [State] = []
+
+    var isEmpty: Bool { states.isEmpty }
+
+    init(capacity: Int) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+    }
+
+    mutating func append(_ state: State) {
+        states.append(state)
+        if states.count > capacity {
+            states.removeFirst(states.count - capacity)
+        }
+    }
+
+    mutating func popLast() -> State? {
+        states.popLast()
+    }
+
+    mutating func removeAll() {
+        states.removeAll(keepingCapacity: true)
+    }
+}
+
 final class LiquifyRenderer: NSObject, MTKViewDelegate {
+    /// Full snapshots make resets and timeline branches easy to undo in one step. Since
+    /// committed strokes don't change, Swift's copy-on-write arrays share their stamp storage
+    private typealias EditState = [[LiquifyBrushStamp]]
+
     private let commandQueue: MTLCommandQueue
     private let renderPipeline: MTLRenderPipelineState
     private let brushPipeline: MTLComputePipelineState
@@ -48,16 +80,25 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
 
     private var sourceTexture: MTLTexture?
     private var committedStrokes: [[LiquifyBrushStamp]] = []
-    private var redoStrokes: [[LiquifyBrushStamp]] = []
+    private var undoStates = HistoryStack<EditState>(
+        capacity: LiquifyConfiguration.History.maximumUndoDepth
+    )
+    private var redoStates = HistoryStack<EditState>(
+        capacity: LiquifyConfiguration.History.maximumUndoDepth
+    )
     private var activeStroke: [LiquifyBrushStamp] = []
+    private var pendingStrokeBaseState: EditState?
+    private var pendingStrokePlaybackTime: Float = 0
+    private var pendingStrokeTrimmedFuture = false
     private var playbackStampIndex = 0
     private var playbackTime: Float = 0
 
     var comparisonMix: Float = 1
     var onHistoryChanged: (() -> Void)?
 
-    var canUndo: Bool { !committedStrokes.isEmpty }
-    var canRedo: Bool { !redoStrokes.isEmpty }
+    var canUndo: Bool { !undoStates.isEmpty }
+    var canRedo: Bool { !redoStates.isEmpty }
+    var hasEdits: Bool { !committedStrokes.isEmpty || !activeStroke.isEmpty }
 
     private var allTimelineStamps: [LiquifyBrushStamp] { committedStrokes.flatMap { $0 } }
     private var recordedDuration: Float { committedStrokes.last?.last?.timelineTime ?? 0 }
@@ -181,7 +222,7 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
                 cgImage: cgImage,
                 options: [.SRGB: true, .textureUsage: MTLTextureUsage.shaderRead.rawValue]
             )
-            reset()
+            discardAllEdits()
         } catch {
             assertionFailure("Unable to load source texture: \(error)")
         }
@@ -218,16 +259,36 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - History and timeline
 
-    /// Restores the completed edit before recording and returns this stroke's timeline origin.
-    /// Drawing may begin while the user is comparing the original or previewing a partial replay.
+    /// Starts a history transaction and returns the new stroke's timeline origin.
+    /// Editing before the end trims future stamps; cancelling restores the previous timeline
     func beginStroke() -> Float {
-        let allStamps = allTimelineStamps
-        if playbackStampIndex != allStamps.count || comparisonMix < 1 {
-            comparisonMix = 1
-            rebuildDisplacement()
+        let stampsBeforeEditing = allTimelineStamps
+        let selectedTime = playbackTime
+        let isAtTimelineEnd =
+            playbackStampIndex == stampsBeforeEditing.count &&
+            selectedTime >= timelineDuration - LiquifyConfiguration.Timeline.endComparisonTolerance
+
+        pendingStrokeBaseState = committedStrokes
+        pendingStrokePlaybackTime = selectedTime
+        pendingStrokeTrimmedFuture = playbackStampIndex < stampsBeforeEditing.count
+
+        if pendingStrokeTrimmedFuture {
+            committedStrokes = committedStrokes.compactMap { stroke in
+                let retained = stroke.prefix { $0.timelineTime <= selectedTime }
+                return retained.isEmpty ? nil : Array(retained)
+            }
+            playbackStampIndex = allTimelineStamps.count
         }
+
+        comparisonMix = 1
         activeStroke.removeAll(keepingCapacity: true)
-        return committedStrokes.isEmpty ? 0 : recordedDuration + LiquifyConfiguration.Timeline.interStrokeGap
+
+        if isAtTimelineEnd {
+            return committedStrokes.isEmpty
+                ? 0
+                : recordedDuration + LiquifyConfiguration.Timeline.interStrokeGap
+        }
+        return selectedTime
     }
 
     func append(stamps: [LiquifyBrushStamp]) {
@@ -237,39 +298,57 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
     }
 
     func endStroke() {
-        guard !activeStroke.isEmpty else { return }
+        guard !activeStroke.isEmpty else {
+            if pendingStrokeTrimmedFuture {
+                restorePendingStrokeBaseState()
+            } else {
+                clearPendingStrokeState()
+            }
+            return
+        }
+
+        undoStates.append(pendingStrokeBaseState ?? committedStrokes)
         committedStrokes.append(activeStroke)
         activeStroke.removeAll(keepingCapacity: true)
-        redoStrokes.removeAll()
+        redoStates.removeAll()
+        clearPendingStrokeState()
         playbackStampIndex = allTimelineStamps.count
         playbackTime = timelineDuration
         onHistoryChanged?()
     }
 
     func cancelStroke() {
-        guard !activeStroke.isEmpty else { return }
-        activeStroke.removeAll()
-        rebuildDisplacement()
+        guard pendingStrokeBaseState != nil || !activeStroke.isEmpty else { return }
+        restorePendingStrokeBaseState()
     }
 
     func undo() {
-        guard let stroke = committedStrokes.popLast() else { return }
-        redoStrokes.append(stroke)
+        guard let previousState = undoStates.popLast() else { return }
+        redoStates.append(committedStrokes)
+        committedStrokes = previousState
+        activeStroke.removeAll()
+        clearPendingStrokeState()
         rebuildDisplacement()
         onHistoryChanged?()
     }
 
     func redo() {
-        guard let stroke = redoStrokes.popLast() else { return }
-        committedStrokes.append(stroke)
+        guard let nextState = redoStates.popLast() else { return }
+        undoStates.append(committedStrokes)
+        committedStrokes = nextState
+        activeStroke.removeAll()
+        clearPendingStrokeState()
         rebuildDisplacement()
         onHistoryChanged?()
     }
 
     func reset() {
+        guard hasEdits else { return }
+        undoStates.append(pendingStrokeBaseState ?? committedStrokes)
+        redoStates.removeAll()
         committedStrokes.removeAll()
-        redoStrokes.removeAll()
         activeStroke.removeAll()
+        clearPendingStrokeState()
         playbackStampIndex = 0
         playbackTime = 0
         comparisonMix = 1
@@ -278,12 +357,11 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
     }
 
     /// Reconstructs the displacement field at a normalized playhead position.
-    /// Forward playback encodes only newly reached stamps; backward scrubbing clears and replays.
+    /// Forward playback encodes only newly reached stamps; backward scrubbing clears and replays
     func seekTimeline(to progress: Float) {
         let clampedProgress = min(1, max(0, progress))
         let targetTime = clampedProgress * timelineDuration
         let stamps = allTimelineStamps
-        comparisonMix = 1
 
         if targetTime < playbackTime || playbackStampIndex > stamps.count {
             clearDisplacement()
@@ -306,6 +384,35 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
         comparisonMix = visible ? 0 : 1
     }
 
+    private func discardAllEdits() {
+        committedStrokes.removeAll()
+        undoStates.removeAll()
+        redoStates.removeAll()
+        activeStroke.removeAll()
+        clearPendingStrokeState()
+        playbackStampIndex = 0
+        playbackTime = 0
+        comparisonMix = 1
+        clearDisplacement()
+        onHistoryChanged?()
+    }
+
+    private func restorePendingStrokeBaseState() {
+        let selectedTime = pendingStrokePlaybackTime
+        if let baseState = pendingStrokeBaseState {
+            committedStrokes = baseState
+        }
+        activeStroke.removeAll()
+        clearPendingStrokeState()
+        rebuildDisplacement(upTo: selectedTime)
+    }
+
+    private func clearPendingStrokeState() {
+        pendingStrokeBaseState = nil
+        pendingStrokePlaybackTime = 0
+        pendingStrokeTrimmedFuture = false
+    }
+
     // MARK: - GPU encoding
 
     private func clearDisplacement() {
@@ -315,13 +422,26 @@ final class LiquifyRenderer: NSObject, MTKViewDelegate {
     }
 
     private func rebuildDisplacement() {
+        rebuildDisplacement(upTo: timelineDuration)
+    }
+
+    private func rebuildDisplacement(upTo targetTime: Float) {
         let stamps = allTimelineStamps
+        var endIndex = 0
+        while targetTime > 0,
+              endIndex < stamps.count,
+              stamps[endIndex].timelineTime <= targetTime {
+            endIndex += 1
+        }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         encodeClear(on: commandBuffer)
-        encode(stamps: stamps, on: commandBuffer)
+        if endIndex > 0 {
+            encode(stamps: Array(stamps[..<endIndex]), on: commandBuffer)
+        }
         commandBuffer.commit()
-        playbackStampIndex = stamps.count
-        playbackTime = timelineDuration
+        playbackStampIndex = endIndex
+        playbackTime = min(max(0, targetTime), timelineDuration)
         comparisonMix = 1
     }
 

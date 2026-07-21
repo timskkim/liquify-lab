@@ -6,7 +6,7 @@ struct CanvasVertexOut {
     float2 uv;
 };
 
-// Keep this layout synchronized with LiquifyBrushStamp in Swift.
+// Keep this layout synchronized with LiquifyBrushStamp in Swift
 struct BrushStamp {
     float2 location;
     float2 delta;
@@ -82,7 +82,7 @@ kernel void applyLiquifyBrushTier2(
         BrushStamp stamp = stamps[index];
         float distanceFromBrush = distance(uv, stamp.location);
         float falloff = 1.0 - smoothstep(0.0, stamp.radius, distanceFromBrush);
-        // Apply smoothstep again to flatten the falloff near the brush center and edge.
+        // Apply smoothstep again to flatten the falloff near the brush center and edge
         falloff = falloff * falloff * (3.0 - 2.0 * falloff);
         updated += stamp.delta * falloff * stamp.strength;
     }
@@ -109,7 +109,7 @@ kernel void applyLiquifyBrushTier1(
         BrushStamp stamp = stamps[index];
         float distanceFromBrush = distance(uv, stamp.location);
         float falloff = 1.0 - smoothstep(0.0, stamp.radius, distanceFromBrush);
-        // Apply smoothstep again to flatten the falloff near the brush center and edge.
+        // Apply smoothstep again to flatten the falloff near the brush center and edge
         falloff = falloff * falloff * (3.0 - 2.0 * falloff);
         updated += stamp.delta * falloff * stamp.strength;
     }

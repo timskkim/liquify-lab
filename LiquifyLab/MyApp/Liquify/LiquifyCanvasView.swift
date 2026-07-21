@@ -1,6 +1,22 @@
 import MetalKit
 import UIKit
 
+/// The input values used to derive the strength of one rendered brush stamp
+struct LiquifyInputMetrics {
+    enum Source {
+        case pencil
+        case finger
+    }
+
+    let source: Source
+    let rawForce: Float
+    let normalizationForceCap: Float
+    let normalizedPressure: Float
+    let brushStrength: Float
+
+    var finalStampStrength: Float { brushStrength * normalizedPressure }
+}
+
 final class LiquifyCanvasView: MTKView {
     private(set) var liquifyRenderer: LiquifyRenderer?
     private let brushCursor = CAShapeLayer()
@@ -9,14 +25,18 @@ final class LiquifyCanvasView: MTKView {
     private var strokeTouchStartTimestamp: TimeInterval = 0
     private var strokeTimelineStart: Float = 0
     private var lastTimelineTime: Float = 0
+    private var lastInputMetricsTimestamp: TimeInterval = -.infinity
 
     var brushDiameter: CGFloat = LiquifyConfiguration.Brush.diameter {
         didSet { updateCursor(at: brushCursor.position) }
     }
     var brushStrength: Float = LiquifyConfiguration.Brush.strength
+    var onInputMetricsChanged: ((LiquifyInputMetrics) -> Void)?
+    var onInputMetricsEnded: (() -> Void)?
 
     var canUndo: Bool { liquifyRenderer?.canUndo ?? false }
     var canRedo: Bool { liquifyRenderer?.canRedo ?? false }
+    var hasEdits: Bool { liquifyRenderer?.hasEdits ?? false }
     var timelineDuration: Float { liquifyRenderer?.timelineDuration ?? LiquifyConfiguration.Timeline.minimumDuration }
     var timelineSegments: [ClosedRange<Float>] { liquifyRenderer?.normalizedStrokeSegments ?? [] }
     var textureMemoryMegabytes: Double { liquifyRenderer?.estimatedTextureMemoryMegabytes ?? 0 }
@@ -122,6 +142,7 @@ final class LiquifyCanvasView: MTKView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let renderer = liquifyRenderer, let touch = touches.first else { return }
+        publishInputMetrics(inputMetrics(for: touch), at: touch.timestamp, immediately: true)
         let viewPoint = touch.location(in: self)
         guard let imagePoint = renderer.imagePoint(for: viewPoint, in: bounds.size) else { return }
 
@@ -150,6 +171,7 @@ final class LiquifyCanvasView: MTKView {
         lastViewPoint = nil
         lastImagePoint = nil
         brushCursor.isHidden = true
+        onInputMetricsEnded?()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -157,11 +179,15 @@ final class LiquifyCanvasView: MTKView {
         lastViewPoint = nil
         lastImagePoint = nil
         brushCursor.isHidden = true
+        onInputMetricsEnded?()
     }
 
     /// Converts coalesced UIKit samples into evenly spaced GPU stamps while
-    /// preserving pressure and the original gesture timing for timeline replay.
+    /// preserving pressure and the original gesture timing for timeline replay
     private func append(sample touch: UITouch) {
+        let metrics = inputMetrics(for: touch)
+        publishInputMetrics(metrics, at: touch.timestamp)
+
         let viewPoint = touch.location(in: self)
         guard let renderer = liquifyRenderer,
               let previousViewPoint = lastViewPoint,
@@ -178,15 +204,6 @@ final class LiquifyCanvasView: MTKView {
             brushDiameter * LiquifyConfiguration.Input.sampleSpacingRatio
         )
         let sampleCount = max(1, Int(ceil(distance / spacing)))
-        let pressure: Float
-        if touch.type == .pencil, touch.maximumPossibleForce > 0 {
-            pressure = Float(min(1, max(
-                LiquifyConfiguration.Input.minimumPencilPressure,
-                touch.force / touch.maximumPossibleForce
-            )))
-        } else {
-            pressure = LiquifyConfiguration.Input.fingerPressure
-        }
 
         let movement = imagePoint - previousImagePoint
         let radius = renderer.normalizedRadius(for: brushDiameter / 2, in: bounds.size)
@@ -205,7 +222,7 @@ final class LiquifyCanvasView: MTKView {
                     location: location,
                     delta: step,
                     radius: radius,
-                    strength: brushStrength * pressure,
+                    strength: metrics.finalStampStrength,
                     timelineTime: lastTimelineTime + timelineStep * Float(index)
                 )
             )
@@ -215,5 +232,39 @@ final class LiquifyCanvasView: MTKView {
         lastViewPoint = viewPoint
         lastImagePoint = imagePoint
         lastTimelineTime = currentTimelineTime
+    }
+
+    private func inputMetrics(for touch: UITouch) -> LiquifyInputMetrics {
+        let isPencil = touch.type == .pencil
+        let normalizationCap = LiquifyConfiguration.Input.pencilForceNormalizationCap
+        let pressure: Float
+        if isPencil {
+            pressure = Float(min(1, max(0, touch.force / normalizationCap)))
+        } else {
+            pressure = LiquifyConfiguration.Input.fingerPressure
+        }
+
+        return LiquifyInputMetrics(
+            source: isPencil ? .pencil : .finger,
+            rawForce: isPencil ? Float(touch.force) : 0,
+            normalizationForceCap: isPencil ? Float(normalizationCap) : 0,
+            normalizedPressure: pressure,
+            brushStrength: brushStrength
+        )
+    }
+
+    /// Throttles only the diagnostic UI; every coalesced sample still reaches the renderer
+    private func publishInputMetrics(
+        _ metrics: LiquifyInputMetrics,
+        at timestamp: TimeInterval,
+        immediately: Bool = false
+    ) {
+        guard immediately ||
+                timestamp - lastInputMetricsTimestamp >= LiquifyConfiguration.Input.metricsDisplayInterval else {
+            return
+        }
+
+        lastInputMetricsTimestamp = timestamp
+        onInputMetricsChanged?(metrics)
     }
 }

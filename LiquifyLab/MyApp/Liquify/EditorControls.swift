@@ -10,7 +10,157 @@ enum EditorPalette {
     static let secondaryInk = UIColor(red: 0.34, green: 0.34, blue: 0.38, alpha: 1)
 }
 
-/// A lightweight, directly scrubbable timeline that renders recorded stroke ranges.
+/// A throttled diagnostic HUD showing how raw input becomes rendered brush strength
+final class InputMetricsView: UIView {
+    private let sourceLabel = UILabel()
+    private let pressureValueLabel = UILabel()
+    private let strengthValueLabel = UILabel()
+    private let pressureBar = UIProgressView(progressViewStyle: .bar)
+    private let strengthBar = UIProgressView(progressViewStyle: .bar)
+    private var displayedBrushStrength = LiquifyConfiguration.Brush.strength
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        isUserInteractionEnabled = false
+        backgroundColor = EditorPalette.chrome.withAlphaComponent(0.92)
+        layer.cornerRadius = 14
+        layer.cornerCurve = .continuous
+        layer.borderWidth = 0.5
+        layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+
+        sourceLabel.text = "INPUT MONITOR · WAITING FOR TOUCH"
+        sourceLabel.font = .systemFont(ofSize: 9, weight: .bold)
+        sourceLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+
+        let rateLabel = UILabel()
+        rateLabel.text = "DISPLAY \(LiquifyConfiguration.Input.metricsDisplayRate) HZ"
+        rateLabel.font = .monospacedDigitSystemFont(ofSize: 8, weight: .medium)
+        rateLabel.textColor = UIColor.white.withAlphaComponent(0.28)
+
+        [pressureValueLabel, strengthValueLabel].forEach {
+            $0.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+            $0.textColor = UIColor.white.withAlphaComponent(0.72)
+            $0.textAlignment = .right
+        }
+        pressureValueLabel.text = String(
+            format: "force 0.000 / cap %.3f = 0.000",
+            LiquifyConfiguration.Input.pencilForceNormalizationCap
+        )
+        strengthValueLabel.text = String(
+            format: "brush %.3f × pressure 0.000 = 0.000",
+            displayedBrushStrength
+        )
+
+        configureBar(pressureBar, color: UIColor.white.withAlphaComponent(0.72))
+        configureBar(strengthBar, color: EditorPalette.accent)
+
+        let header = UIStackView(arrangedSubviews: [sourceLabel, UIView(), rateLabel])
+        header.axis = .horizontal
+        header.alignment = .center
+
+        let stack = UIStackView(arrangedSubviews: [
+            header,
+            makeMetricRow(title: "PRESSURE", valueLabel: pressureValueLabel, bar: pressureBar),
+            makeMetricRow(title: "FINAL STAMP STRENGTH", valueLabel: strengthValueLabel, bar: strengthBar)
+        ])
+        stack.axis = .vertical
+        stack.spacing = 6
+        addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9)
+        ])
+
+        isAccessibilityElement = true
+        accessibilityLabel = "Input pressure monitor"
+        accessibilityValue = "Waiting for touch"
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("InputMetricsView is created programmatically")
+    }
+
+    func update(with metrics: LiquifyInputMetrics) {
+        switch metrics.source {
+        case .pencil:
+            sourceLabel.text = "APPLE PENCIL · RAW FORCE"
+            pressureValueLabel.text = String(
+                format: "force %.3f / cap %.3f = %.3f",
+                metrics.rawForce,
+                metrics.normalizationForceCap,
+                metrics.normalizedPressure
+            )
+        case .finger:
+            sourceLabel.text = "FINGER · FIXED FALLBACK"
+            pressureValueLabel.text = String(
+                format: "fixed pressure = %.3f",
+                metrics.normalizedPressure
+            )
+        }
+
+        displayedBrushStrength = metrics.brushStrength
+        strengthValueLabel.text = String(
+            format: "brush %.3f × pressure %.3f = %.3f",
+            metrics.brushStrength,
+            metrics.normalizedPressure,
+            metrics.finalStampStrength
+        )
+        pressureBar.setProgress(metrics.normalizedPressure, animated: true)
+        strengthBar.setProgress(metrics.finalStampStrength, animated: true)
+        accessibilityValue = String(
+            format: "Pressure %.3f, brush strength %.3f, final stamp strength %.3f",
+            metrics.normalizedPressure,
+            metrics.brushStrength,
+            metrics.finalStampStrength
+        )
+    }
+
+    func reset() {
+        sourceLabel.text = "INPUT MONITOR · WAITING FOR TOUCH"
+        pressureValueLabel.text = String(
+            format: "force 0.000 / cap %.3f = 0.000",
+            LiquifyConfiguration.Input.pencilForceNormalizationCap
+        )
+        strengthValueLabel.text = String(
+            format: "brush %.3f × pressure 0.000 = 0.000",
+            displayedBrushStrength
+        )
+        pressureBar.setProgress(0, animated: true)
+        strengthBar.setProgress(0, animated: true)
+        accessibilityValue = "Waiting for touch"
+    }
+
+    private func configureBar(_ bar: UIProgressView, color: UIColor) {
+        bar.progress = 0
+        bar.progressTintColor = color
+        bar.trackTintColor = EditorPalette.lane
+        bar.layer.cornerRadius = 2
+        bar.clipsToBounds = true
+        bar.transform = CGAffineTransform(scaleX: 1, y: 2)
+    }
+
+    private func makeMetricRow(title: String, valueLabel: UILabel, bar: UIProgressView) -> UIView {
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = .systemFont(ofSize: 8, weight: .bold)
+        titleLabel.textColor = UIColor.white.withAlphaComponent(0.42)
+
+        let labels = UIStackView(arrangedSubviews: [titleLabel, UIView(), valueLabel])
+        labels.axis = .horizontal
+        labels.alignment = .center
+
+        let row = UIStackView(arrangedSubviews: [labels, bar])
+        row.axis = .vertical
+        row.spacing = 3
+        return row
+    }
+}
+
+/// A lightweight, directly scrubbable timeline that renders recorded stroke ranges
 final class TimelineControl: UIControl {
     var progress: Float = 1 {
         didSet {
